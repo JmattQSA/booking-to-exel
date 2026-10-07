@@ -25,6 +25,7 @@ DATE_FORMATS = [
 ]
 EXCEL_EPOCH = datetime(1899, 12, 30)
 SOURCE_COL = "Source file"
+NO_GROUP = "(don't group)"
 
 
 def downloads_folder():
@@ -241,11 +242,13 @@ def norm(v):
     return re.sub(r"\s+", " ", s).lower()
 
 
-def merge(files, columns, dedupe, match_col, add_source):
-    """files: list of dicts {name, map(lower->header), rows}. columns: display names."""
-    out_headers = list(columns) + ([SOURCE_COL] if add_source else [])
-    data, seen = [], set()
-    total = dupes = 0
+def fmt_value(v):
+    return v.strftime("%m/%d/%Y %I:%M %p") if isinstance(v, datetime) else str(v)
+
+
+def collect_rows(files, columns, add_source):
+    """Pull the chosen columns out of every file into one list of rows."""
+    rows = []
     for f in files:
         for row in f["rows"]:
             vals = []
@@ -255,25 +258,84 @@ def merge(files, columns, dedupe, match_col, add_source):
                 vals.append(v if isinstance(v, datetime) else str(v).strip())
             if not any(v != "" for v in vals):
                 continue
-            total += 1
-            if dedupe:
-                if match_col:
-                    i = columns.index(match_col)
-                    key = norm(vals[i]) if vals[i] != "" else None
-                else:
-                    key = tuple(norm(v) for v in vals)
-                if key is not None:
-                    if key in seen:
-                        dupes += 1
-                        continue
-                    seen.add(key)
             if add_source:
                 vals.append(f["name"])
-            data.append(vals)
+            rows.append(vals)
+    return rows
 
-    # Date columns: every non-blank value is a date
+
+def standardize(rows, n_cols):
+    """Same value written differently (caps / spaces) -> use the first spelling seen."""
+    for i in range(n_cols):
+        canon = {}
+        for r in rows:
+            v = r[i]
+            if v == "" or isinstance(v, datetime):
+                continue
+            r[i] = canon.setdefault(norm(v), v)
+
+
+def remove_duplicates(rows, n_cols):
+    seen, out = set(), []
+    for r in rows:
+        key = tuple(norm(v) for v in r[:n_cols])
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out, len(rows) - len(out)
+
+
+def group_rows(rows, gi, layout):
+    """Group rows that share the same value in column gi.
+    layout 'stack'   -> value shown once, its other rows directly underneath
+    layout 'combine' -> one row per value, other columns' values joined with '; '
+    Returns (rows, bold_cells)."""
+    groups, order = {}, []
+    for r in rows:
+        key = norm(r[gi]) if r[gi] != "" else object()   # blanks never group
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(r)
+
+    out, bold = [], set()
+    for key in order:
+        grp = groups[key]
+        if layout == "combine":
+            row = []
+            for c in range(len(grp[0])):
+                vals, seen = [], set()
+                for r in grp:
+                    v = r[c]
+                    if v == "":
+                        continue
+                    k = norm(v)
+                    if k not in seen:
+                        seen.add(k)
+                        vals.append(v)
+                if not vals:
+                    row.append("")
+                elif len(vals) == 1:
+                    row.append(vals[0])
+                else:
+                    row.append("; ".join(fmt_value(v) for v in vals))
+            out.append(row)
+        else:
+            for j, r in enumerate(grp):
+                r = list(r)
+                if j == 0:
+                    if len(grp) > 1:
+                        bold.add((len(out), gi))
+                else:
+                    r[gi] = ""
+                out.append(r)
+    return out, bold
+
+
+def to_excel_values(headers, data):
+    """Turn date columns into Excel dates; everything else stays text."""
     date_cols = set()
-    for i in range(len(out_headers)):
+    for i in range(len(headers)):
         values = [r[i] for r in data if r[i] != ""]
         if values and all(isinstance(v, datetime) or parse_date(v) for v in values):
             date_cols.add(i)
@@ -285,8 +347,27 @@ def merge(files, columns, dedupe, match_col, add_source):
                 d = v if isinstance(v, datetime) else parse_date(v)
                 r[i] = (d - EXCEL_EPOCH).total_seconds() / 86400
             elif isinstance(v, datetime):
-                r[i] = v.strftime("%m/%d/%Y %I:%M %p")
-    return out_headers, data, date_cols, total, dupes
+                r[i] = fmt_value(v)
+    return date_cols
+
+
+def merge(files, columns, opts):
+    headers = list(columns) + ([SOURCE_COL] if opts["source"] else [])
+    n = len(columns)
+    rows = collect_rows(files, columns, opts["source"])
+    total = len(rows)
+
+    if opts["standardize"]:
+        standardize(rows, n)
+    dupes = 0
+    if opts["dedupe"]:
+        rows, dupes = remove_duplicates(rows, n)
+    bold = set()
+    if opts["group_col"]:
+        rows, bold = group_rows(rows, columns.index(opts["group_col"]), opts["layout"])
+
+    date_cols = to_excel_values(headers, rows)
+    return headers, rows, date_cols, bold, {"total": total, "dupes": dupes, "final": len(rows)}
 
 
 # ---------------- Excel file writer (standard library only) ----------------
@@ -351,24 +432,26 @@ SHEET_RELS = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/>
 </Relationships>"""
 
-# Style 0 = normal, 1 = date/time, 2 = text
+# Style 0 = normal, 1 = date/time, 2 = text, 3 = bold text
 STYLES = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
 <numFmts count="1"><numFmt numFmtId="164" formatCode="mm/dd/yyyy h:mm AM/PM"/></numFmts>
-<fonts count="1"><font><sz val="10"/><name val="Arial"/><family val="2"/></font></fonts>
+<fonts count="2"><font><sz val="10"/><name val="Arial"/><family val="2"/></font><font><b/><sz val="10"/><name val="Arial"/><family val="2"/></font></fonts>
 <fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>
 <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
 <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
-<cellXfs count="3">
+<cellXfs count="4">
 <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
 <xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
 <xf numFmtId="49" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
+<xf numFmtId="49" fontId="1" fillId="0" borderId="0" xfId="0" applyNumberFormat="1" applyFont="1"/>
 </cellXfs>
 <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
 </styleSheet>"""
 
 
-def write_xlsx(headers, data, date_cols, out_path):
+def write_xlsx(headers, data, date_cols, out_path, bold_cells=None):
+    bold_cells = bold_cells or set()
     headers = _unique_headers(headers)
     n_cols, n_rows = len(headers), len(data) + 1
     ref = "A1:{}{}".format(_col(n_cols), n_rows)
@@ -395,7 +478,7 @@ def write_xlsx(headers, data, date_cols, out_path):
             if i in date_cols and v != "":
                 cells.append('<c r="{}" s="1"><v>{}</v></c>'.format(ref_, v))
             elif v != "":
-                cells.append(text_cell(ref_, v, 2))
+                cells.append(text_cell(ref_, v, 3 if (r - 2, i) in bold_cells else 2))
         rows_xml.append('<row r="{}">{}</row>'.format(r, "".join(cells)))
 
     sheet = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -435,20 +518,23 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Merge Files to Excel")
-        self.geometry("640x780")
-        self.minsize(560, 680)
+        self.geometry("660x860")
+        self.minsize(580, 760)
 
         self.files = []          # {path, name, headers, map, rows}
         self.all_cols = []       # display names, in order of first appearance
         default_out = downloads_folder() / "Merged_{:%Y%m%d}.xlsx".format(date.today())
         self.out_var = tk.StringVar(value=str(default_out))
         self.open_var = tk.BooleanVar(value=True)
+        self.std_var = tk.BooleanVar(value=True)
         self.dedupe_var = tk.BooleanVar(value=True)
         self.source_var = tk.BooleanVar(value=False)
-        self.match_var = tk.StringVar(value="All selected columns")
+        self.group_var = tk.StringVar(value=NO_GROUP)
+        self.layout_var = tk.StringVar(value="stack")
         self.status_var = tk.StringVar(value="Step 1: Add one or more files (.tsv, .csv, .xlsx)")
         self._worker = None
         self._result = None
+        self._group_touched = False
 
         pad = {"padx": 12, "pady": 5}
         ttk.Style(self).configure("Big.TButton", font=("Segoe UI", 11, "bold"), padding=8)
@@ -489,18 +575,29 @@ class App(tk.Tk):
         csb.pack(side="right", fill="y")
         self.cols.bind("<<ListboxSelect>>", lambda e: self.refresh_match_options())
 
-        # 3. Duplicates
-        f3 = ttk.LabelFrame(self, text="3. Duplicates")
+        # 3. Clean up & group
+        f3 = ttk.LabelFrame(self, text="3. Clean up & group")
         f3.pack(fill="x", **pad)
-        ttk.Checkbutton(f3, text="Show duplicate rows only once", variable=self.dedupe_var,
-                        command=self.toggle_match).pack(anchor="w", padx=8, pady=(6, 2))
-        mrow = ttk.Frame(f3)
-        mrow.pack(fill="x", padx=8, pady=(0, 4))
-        ttk.Label(mrow, text="A row is a duplicate when this matches:").pack(side="left")
-        self.match_box = ttk.Combobox(mrow, textvariable=self.match_var, state="readonly", width=30)
-        self.match_box.pack(side="left", padx=6)
+        ttk.Checkbutton(f3, text="Make matching values identical (fixes different caps / extra spaces)",
+                        variable=self.std_var).pack(anchor="w", padx=8, pady=(6, 2))
+        ttk.Checkbutton(f3, text="Remove duplicate rows (every kept column matches)",
+                        variable=self.dedupe_var).pack(anchor="w", padx=8, pady=2)
+        grow = ttk.Frame(f3)
+        grow.pack(fill="x", padx=8, pady=(6, 2))
+        ttk.Label(grow, text="Group rows by:").pack(side="left")
+        self.group_box = ttk.Combobox(grow, textvariable=self.group_var, state="readonly", width=32)
+        self.group_box.pack(side="left", padx=6)
+        self.group_box.bind("<<ComboboxSelected>>", lambda e: self.toggle_layout())
+        self.layout_btns = [
+            ttk.Radiobutton(f3, text="Show each value once, with its other rows lined up underneath",
+                            variable=self.layout_var, value="stack"),
+            ttk.Radiobutton(f3, text="Combine into ONE row per value (different values joined with ; )",
+                            variable=self.layout_var, value="combine"),
+        ]
+        for b in self.layout_btns:
+            b.pack(anchor="w", padx=28, pady=1)
         ttk.Checkbutton(f3, text="Add a \"Source file\" column", variable=self.source_var).pack(
-            anchor="w", padx=8, pady=(0, 6))
+            anchor="w", padx=8, pady=(4, 6))
 
         # 4. Output
         f4 = ttk.LabelFrame(self, text="4. Save merged file as")
@@ -606,14 +703,20 @@ class App(tk.Tk):
         return [self.all_cols[i] for i in self.cols.curselection()]
 
     def refresh_match_options(self):
-        options = ["All selected columns"] + self.selected_cols()
-        self.match_box["values"] = options
-        if self.match_var.get() not in options:
-            self.match_var.set("All selected columns")
-        self.toggle_match()
+        cols = self.selected_cols()
+        self.group_box["values"] = [NO_GROUP] + cols
+        if self.group_var.get() not in cols:
+            # Suggest a "name" column the first time one is available
+            guess = next((c for c in cols if "name" in c.lower()), None)
+            self.group_var.set(guess if (guess and not self._group_touched) else NO_GROUP)
+        self.toggle_layout()
 
-    def toggle_match(self):
-        self.match_box.config(state="readonly" if self.dedupe_var.get() else "disabled")
+    def toggle_layout(self):
+        if self.group_var.get() != NO_GROUP:
+            self._group_touched = True
+        state = "disabled" if self.group_var.get() == NO_GROUP else "normal"
+        for b in self.layout_btns:
+            b.config(state=state)
 
     def pick_out(self):
         current = Path(self.out_var.get())
@@ -640,9 +743,14 @@ class App(tk.Tk):
             messagebox.showerror("Bad save location", str(e))
             return
 
-        match = self.match_var.get()
-        match_col = None if match == "All selected columns" else match
-        dedupe, add_source = self.dedupe_var.get(), self.source_var.get()
+        group = self.group_var.get()
+        opts = {
+            "standardize": self.std_var.get(),
+            "dedupe": self.dedupe_var.get(),
+            "group_col": None if group == NO_GROUP else group,
+            "layout": self.layout_var.get(),
+            "source": self.source_var.get(),
+        }
         files = list(self.files)
 
         self.run_btn.config(state="disabled")
@@ -651,17 +759,17 @@ class App(tk.Tk):
 
         def work():
             try:
-                headers, data, date_cols, total, dupes = merge(files, columns, dedupe, match_col, add_source)
+                headers, data, date_cols, bold, stats = merge(files, columns, opts)
                 if not data:
                     raise RuntimeError("No rows to save — the selected columns are empty in every file.")
                 try:
-                    write_xlsx(headers, data, date_cols, out_path)
+                    write_xlsx(headers, data, date_cols, out_path, bold)
                 except PermissionError:
                     raise RuntimeError("Can't save — the file is probably open in Excel.\n"
                                        "Close it (or pick a different name) and try again.")
                 if not out_path.exists():
                     raise RuntimeError("The file could not be created at:\n{}".format(out_path))
-                self._result = ("ok", (len(data), dupes, total), out_path)
+                self._result = ("ok", stats, out_path)
             except Exception as e:
                 self._result = ("err", str(e), out_path)
 
@@ -677,9 +785,8 @@ class App(tk.Tk):
         self.run_btn.config(state="normal")
         kind, value, out_path = self._result
         if kind == "ok":
-            kept, dupes, total = value
-            msg = "Done! {} rows saved ({} duplicates removed from {} total) to {}".format(
-                kept, dupes, total, out_path)
+            msg = "Done! {total} rows in → {final} rows out ({dupes} duplicates removed). Saved to {path}".format(
+                path=out_path, **value)
             self.status_var.set(msg)
             if self.open_var.get():
                 os.startfile(str(out_path))
