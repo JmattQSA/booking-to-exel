@@ -3,9 +3,19 @@ Option Explicit
 
 ' ============================================================
 '  Weekly Schedule Builder
-'  Combines a Microsoft Bookings export (Bookings_Data) with a
-'  ServiceNow list export (SNOW_Data) into a clean, day-by-day
-'  weekly sheet (Weekly).
+'
+'  Bookings_Data  (Bookings report)  uses: Date, Customer, Custom Fields
+'  SNOW_Data      (ServiceNow export) uses: Reserved for, Serial number, Model
+'
+'  Weekly output columns:
+'    Date | Ticket | Old | New | Name of User | Device New | Device Old
+'
+'    Ticket       = RITM####### or INC####### found in Custom Fields
+'    Name of User = Bookings Customer (matched to SNOW "Reserved for",
+'                   so the name is shown once)
+'    New          = SNOW Serial number
+'    Device New   = SNOW Model
+'    Old / Device Old are left blank to fill in at the appointment
 '
 '  Macros:
 '    BuildWeeklySheet  - builds the Weekly tab
@@ -18,21 +28,16 @@ Private Const SH_BOOK As String = "Bookings_Data"
 Private Const SH_SNOW As String = "SNOW_Data"
 Private Const SH_OUT As String = "Weekly"
 
-' Appointment record fields
-Private Const F_KEY As Long = 0      ' date+time serial, used for sorting
-Private Const F_TIME As Long = 1
-Private Const F_CUST As Long = 2
-Private Const F_SVC As Long = 3
-Private Const F_STAFF As Long = 4
-Private Const F_TKT As Long = 5
-Private Const F_STATE As Long = 6
-Private Const F_PRI As Long = 7
-Private Const F_DESC As Long = 8
-Private Const F_ASSIGN As Long = 9
-Private Const F_NOTES As Long = 10
-
-Private Const NCOLS As Long = 10    ' output columns A:J
+Private Const NCOLS As Long = 7
 Private Const HDR_ROW As Long = 5
+
+' Appointment record fields
+Private Const F_KEY As Long = 0     ' date+time serial (sort)
+Private Const F_HASTIME As Long = 1
+Private Const F_TKT As Long = 2
+Private Const F_NAME As Long = 3
+Private Const F_SERIAL As Long = 4
+Private Const F_MODEL As Long = 5
 
 ' ------------------------------------------------------------
 '  MAIN
@@ -40,7 +45,7 @@ Private Const HDR_ROW As Long = 5
 Public Sub BuildWeeklySheet()
     Dim wsB As Worksheet, wsS As Worksheet, wsO As Worksheet
     Dim weekStart As Date, dayCount As Long
-    Dim tickets As Object, byName As Object
+    Dim serials As Object, models As Object
     Dim appts() As Variant, nAppt As Long
     Dim calcMode As Long
 
@@ -56,13 +61,13 @@ Public Sub BuildWeeklySheet()
     Application.ScreenUpdating = False
     Application.Calculation = xlCalculationManual
 
-    Set tickets = CreateObject("Scripting.Dictionary")
-    tickets.CompareMode = vbTextCompare
-    Set byName = CreateObject("Scripting.Dictionary")
-    byName.CompareMode = vbTextCompare
+    Set serials = CreateObject("Scripting.Dictionary")
+    serials.CompareMode = vbTextCompare
+    Set models = CreateObject("Scripting.Dictionary")
+    models.CompareMode = vbTextCompare
 
-    LoadTickets wsS, tickets, byName
-    nAppt = LoadAppointments(wsB, weekStart, dayCount, tickets, byName, appts)
+    LoadReservations wsS, serials, models
+    nAppt = LoadAppointments(wsB, weekStart, dayCount, serials, models, appts)
     If nAppt > 1 Then SortAppts appts, nAppt
     RenderWeekly wsO, weekStart, dayCount, appts, nAppt
 
@@ -75,89 +80,68 @@ Public Sub BuildWeeklySheet()
 Fail:
     Application.ScreenUpdating = True
     If calcMode <> 0 Then Application.Calculation = calcMode
-    MsgBox "Couldn't build the weekly sheet:" & vbCrLf & vbCrLf & Err.Description, vbExclamation, "Weekly Schedule Builder"
+    MsgBox "Couldn't build the weekly sheet:" & vbCrLf & vbCrLf & Err.Description, _
+           vbExclamation, "Weekly Schedule Builder"
 End Sub
 
 ' ------------------------------------------------------------
-'  SERVICENOW
+'  SERVICENOW: Reserved for -> Serial number / Model
 ' ------------------------------------------------------------
-Private Sub LoadTickets(ws As Worksheet, tickets As Object, byName As Object)
+Private Sub LoadReservations(ws As Worksheet, serials As Object, models As Object)
     Dim lastR As Long, lastC As Long, r As Long, data As Variant
-    Dim cNum As Long, cDesc As Long, cState As Long, cPri As Long
-    Dim cAssign As Long, cCaller As Long, cReqFor As Long
-    Dim num As String, rec As Variant
+    Dim cRes As Long, cSer As Long, cMod As Long
+    Dim k As String, ser As String, mdl As String
 
     lastR = LastRow(ws)
-    If lastR < 2 Then Exit Sub          ' no tickets pasted - schedule still builds
+    If lastR < 2 Then Exit Sub          ' nothing pasted - schedule still builds
 
-    cNum = FindCol(ws, "Number", "Ticket", "Ticket Number")
-    If cNum = 0 Then Err.Raise vbObjectError + 1, , _
-        "SNOW_Data: no 'Number' column found in row 1. Paste the export starting at cell A1, including headers."
-    cDesc = FindCol(ws, "Short description", "Description", "Summary")
-    cState = FindCol(ws, "State", "Status", "Incident state")
-    cPri = FindCol(ws, "Priority")
-    cAssign = FindCol(ws, "Assigned to", "Assignee")
-    cCaller = FindCol(ws, "Caller", "Opened by", "Requested by")
-    cReqFor = FindCol(ws, "Requested for")
+    cRes = FindCol(ws, "Reserved for")
+    If cRes = 0 Then Err.Raise vbObjectError + 1, , _
+        "SNOW_Data: no 'Reserved for' column found in row 1. Paste the export starting at A1, headers included."
+    cSer = FindCol(ws, "Serial number", "Serial")
+    cMod = FindCol(ws, "Model", "Model ID")
+    If cSer = 0 And cMod = 0 Then Err.Raise vbObjectError + 2, , _
+        "SNOW_Data: no 'Serial number' or 'Model' column found in row 1."
 
     lastC = LastCol(ws)
     data = ws.Range(ws.Cells(1, 1), ws.Cells(lastR, lastC)).Value
 
     For r = 2 To lastR
-        num = UCase$(CellText(data, r, cNum))
-        If Len(num) > 0 Then
-            ' rec: 0 Number, 1 State, 2 Priority, 3 Short desc, 4 Assigned to
-            rec = Array(num, CellText(data, r, cState), CellText(data, r, cPri), _
-                        CellText(data, r, cDesc), CellText(data, r, cAssign))
-            tickets(num) = rec
-            AddName byName, CellText(data, r, cCaller), rec
-            AddName byName, CellText(data, r, cReqFor), rec
+        k = NormName(CellText(data, r, cRes))
+        If Len(k) > 0 Then
+            ser = CellText(data, r, cSer)
+            mdl = CellText(data, r, cMod)
+            ' Same person with more than one device: stack them in one cell
+            If serials.Exists(k) Then
+                serials(k) = serials(k) & vbLf & ser
+                models(k) = models(k) & vbLf & mdl
+            Else
+                serials.Add k, ser
+                models.Add k, mdl
+            End If
         End If
     Next r
 End Sub
 
-' Name lookup: keep an open ticket over a closed one for the same person
-Private Sub AddName(byName As Object, ByVal nm As String, rec As Variant)
-    Dim k As String, cur As Variant
-    k = NormName(nm)
-    If Len(k) = 0 Then Exit Sub
-    If Not byName.Exists(k) Then
-        byName.Add k, rec
-    Else
-        cur = byName(k)
-        If IsClosed(CStr(cur(1))) And Not IsClosed(CStr(rec(1))) Then byName(k) = rec
-    End If
-End Sub
-
-Private Function IsClosed(ByVal state As String) As Boolean
-    state = LCase$(state)
-    IsClosed = (InStr(state, "closed") > 0 Or InStr(state, "resolved") > 0 _
-                Or InStr(state, "cancel") > 0 Or InStr(state, "complete") > 0)
-End Function
-
 ' ------------------------------------------------------------
-'  BOOKINGS
+'  BOOKINGS: Date, Customer, Custom Fields
 ' ------------------------------------------------------------
 Private Function LoadAppointments(ws As Worksheet, ByVal weekStart As Date, ByVal dayCount As Long, _
-                                  tickets As Object, byName As Object, appts() As Variant) As Long
-    Dim lastR As Long, lastC As Long, r As Long, c As Long, n As Long, data As Variant
-    Dim cDt As Long, cTime As Long, cCust As Long, cSvc As Long, cStaff As Long, cNotes As Long
-    Dim dt As Double, tm As Double, dayOnly As Double, tmp As Double
-    Dim rowText As String, tkt As String, cust As String, rec As Variant, hasTime As Boolean
+                                  serials As Object, models As Object, appts() As Variant) As Long
+    Dim lastR As Long, lastC As Long, r As Long, n As Long, data As Variant
+    Dim cDt As Long, cCust As Long, cCustom As Long
+    Dim dt As Double, dayOnly As Double
+    Dim cust As String, k As String, ser As String, mdl As String
 
     lastR = LastRow(ws)
-    If lastR < 2 Then Err.Raise vbObjectError + 2, , _
-        "Bookings_Data is empty. Paste the Bookings export starting at cell A1, including headers."
+    If lastR < 2 Then Err.Raise vbObjectError + 3, , _
+        "Bookings_Data is empty. Paste the Bookings report starting at A1, headers included."
 
-    cDt = FindCol(ws, "Date", "Start Date", "Appointment Date", "Start", "Date Time", "Start Date Time")
-    If cDt = 0 Then Err.Raise vbObjectError + 3, , _
-        "Bookings_Data: no date column found in row 1 (looked for Date / Start Date / Appointment Date / Start)."
-    cTime = FindCol(ws, "Time", "Start Time", "Appointment Time")
-    If cTime = cDt Then cTime = 0
-    cCust = FindCol(ws, "Customer Name", "Customer", "Name", "Attendee", "Client Name")
-    cSvc = FindCol(ws, "Service", "Service Name", "Service Type", "Appointment Type")
-    cStaff = FindCol(ws, "Staff", "Staff Name", "Staff Member", "Staff Members", "Staff Name(s)", "Assigned Staff")
-    cNotes = FindCol(ws, "Notes", "Customer Notes", "Internal Notes", "Additional Information", "Comments")
+    cDt = FindCol(ws, "Date", "Start Date", "Appointment Date", "Start")
+    If cDt = 0 Then Err.Raise vbObjectError + 4, , "Bookings_Data: no 'Date' column found in row 1."
+    cCust = FindCol(ws, "Customer", "Customer Name")
+    If cCust = 0 Then Err.Raise vbObjectError + 5, , "Bookings_Data: no 'Customer' column found in row 1."
+    cCustom = FindCol(ws, "Custom Fields", "Custom Field", "Custom Questions")
 
     lastC = LastCol(ws)
     data = ws.Range(ws.Cells(1, 1), ws.Cells(lastR, lastC)).Value
@@ -167,38 +151,19 @@ Private Function LoadAppointments(ws As Worksheet, ByVal weekStart As Date, ByVa
         If ParseDate(data(r, cDt), dt) Then
             dayOnly = Int(dt)
             If dayOnly >= CDbl(weekStart) And dayOnly < CDbl(weekStart) + dayCount Then
-
-                ' Time of day: Time column if present, else from the date cell
-                hasTime = False
-                If cTime > 0 Then
-                    If ParseDate(data(r, cTime), tmp) Then tm = tmp - Int(tmp): hasTime = True
-                End If
-                If Not hasTime Then tm = dt - dayOnly
-
-                ' Ticket: look for INC/RITM/REQ/etc anywhere in the row, else match by name
-                rowText = ""
-                For c = 1 To lastC
-                    rowText = rowText & " " & CellText(data, r, c)
-                Next c
                 cust = CellText(data, r, cCust)
-                tkt = ExtractTicket(rowText)
-
-                If Len(tkt) > 0 Then
-                    If tickets.Exists(tkt) Then
-                        rec = tickets(tkt)
-                    Else
-                        rec = Array(tkt, "Not in SNOW export", "", "", "")
+                k = NormName(cust)
+                ser = ""
+                mdl = ""
+                If Len(k) > 0 Then
+                    If serials.Exists(k) Then
+                        ser = serials(k)
+                        mdl = models(k)
                     End If
-                ElseIf byName.Exists(NormName(cust)) Then
-                    rec = byName(NormName(cust))
-                Else
-                    rec = Array("", "", "", "", "")
                 End If
-
                 n = n + 1
-                appts(n) = Array(dayOnly + tm, Format$(tm, "h:mm AM/PM"), cust, _
-                                 CellText(data, r, cSvc), CellText(data, r, cStaff), _
-                                 rec(0), rec(1), rec(2), rec(3), rec(4), CellText(data, r, cNotes))
+                appts(n) = Array(dt, (dt - dayOnly) > 0.0001, _
+                                 ExtractTickets(CellText(data, r, cCustom)), cust, ser, mdl)
             End If
         End If
     Next r
@@ -206,32 +171,41 @@ Private Function LoadAppointments(ws As Worksheet, ByVal weekStart As Date, ByVa
     LoadAppointments = n
 End Function
 
-' Finds the first ServiceNow-style number (e.g. INC0012345, RITM0045678)
-Private Function ExtractTicket(ByVal s As String) As String
-    Dim prefixes As Variant, p As Variant, pos As Long, j As Long, digits As String, ch As String
+' Returns every RITM+7 digits / INC+7 digits found (exact length), comma separated
+Private Function ExtractTickets(ByVal s As String) As String
+    Dim prefixes As Variant, p As Variant, pos As Long, j As Long
+    Dim digits As String, before As String, found As String, tkt As String
+
     s = UCase$(s)
-    prefixes = Array("SCTASK", "RITM", "INC", "REQ", "CHG", "PRB", "TASK")
+    prefixes = Array("RITM", "INC")
     For Each p In prefixes
         pos = InStr(1, s, p)
         Do While pos > 0
-            j = pos + Len(p)
-            digits = ""
-            Do While j <= Len(s)
-                ch = Mid$(s, j, 1)
-                If ch Like "#" Then
-                    digits = digits & ch
-                    j = j + 1
-                Else
-                    Exit Do
+            ' prefix must not be glued to another letter (e.g. "XINC")
+            If pos > 1 Then before = Mid$(s, pos - 1, 1) Else before = " "
+            If Not (before Like "[A-Z]") Then
+                j = pos + Len(p)
+                digits = ""
+                Do While j <= Len(s)
+                    If Mid$(s, j, 1) Like "#" Then
+                        digits = digits & Mid$(s, j, 1)
+                        j = j + 1
+                    Else
+                        Exit Do
+                    End If
+                Loop
+                If Len(digits) = 7 Then
+                    tkt = p & digits
+                    If InStr(1, "," & found & ",", "," & tkt & ",") = 0 Then
+                        If Len(found) > 0 Then found = found & ","
+                        found = found & tkt
+                    End If
                 End If
-            Loop
-            If Len(digits) >= 5 Then
-                ExtractTicket = p & digits
-                Exit Function
             End If
             pos = InStr(pos + 1, s, p)
         Loop
     Next p
+    ExtractTickets = Replace(found, ",", ", ")
 End Function
 
 ' ------------------------------------------------------------
@@ -240,30 +214,30 @@ End Function
 Private Sub RenderWeekly(ws As Worksheet, ByVal weekStart As Date, ByVal dayCount As Long, _
                          appts() As Variant, ByVal n As Long)
     Dim headers As Variant, widths As Variant
-    Dim r As Long, d As Long, i As Long, k As Long, cnt As Long, linked As Long
-    Dim dayDate As Date, a As Variant, zebra As Boolean
-    Dim navy As Long, band As Long, stripe As Long, rule As Long, muted As Long
+    Dim r As Long, i As Long, matched As Long, a As Variant
+    Dim curDay As Double, shade As Boolean, firstRow As Long
+    Dim navy As Long, dayFill As Long, rule As Long, muted As Long, fillIn As Long
 
     navy = RGB(31, 56, 100)
-    band = RGB(217, 225, 242)
-    stripe = RGB(246, 248, 252)
+    dayFill = RGB(238, 242, 249)
     rule = RGB(210, 214, 222)
     muted = RGB(120, 120, 120)
+    fillIn = RGB(255, 251, 235)
 
     ws.Cells.Clear
     ws.Cells.Font.Name = "Arial"
     ws.Cells.Font.Size = 10
     ws.Cells.VerticalAlignment = xlTop
+    ws.Columns(4).NumberFormat = "@"   ' keep serial numbers as text
 
-    headers = Array("Time", "Customer", "Service", "Staff", "Ticket #", "State", "Priority", _
-                    "Short Description", "Assigned To", "Notes")
-    widths = Array(10, 22, 22, 18, 14, 16, 12, 42, 18, 32)
+    headers = Array("Date", "Ticket", "Old", "New", "Name of User", "Device New", "Device Old")
+    widths = Array(20, 16, 18, 20, 26, 30, 26)
     For i = 0 To NCOLS - 1
         ws.Columns(i + 1).ColumnWidth = widths(i)
     Next i
 
     For i = 1 To n
-        If Len(appts(i)(F_TKT)) > 0 Then linked = linked + 1
+        If Len(appts(i)(F_SERIAL)) > 0 Or Len(appts(i)(F_MODEL)) > 0 Then matched = matched + 1
     Next i
 
     ' Title block
@@ -276,11 +250,11 @@ Private Sub RenderWeekly(ws As Worksheet, ByVal weekStart As Date, ByVal dayCoun
     ws.Range("A2").Value = "Week of " & Format$(weekStart, "dddd, mmm d") & " to " & _
                            Format$(weekStart + dayCount - 1, "dddd, mmm d, yyyy")
     ws.Range("A2").Font.Size = 11
-    ws.Range("A3").Value = n & " appointments   |   " & linked & " linked to a ticket   |   built " & _
+    ws.Range("A3").Value = n & " appointments   |   " & matched & " with a reserved device   |   built " & _
                            Format$(Now, "mmm d, h:mm AM/PM")
     ws.Range("A3").Font.Color = muted
 
-    ' Column headers
+    ' Headers
     For i = 0 To NCOLS - 1
         ws.Cells(HDR_ROW, i + 1).Value = headers(i)
     Next i
@@ -293,90 +267,79 @@ Private Sub RenderWeekly(ws As Worksheet, ByVal weekStart As Date, ByVal dayCoun
     End With
 
     r = HDR_ROW + 1
-    k = 1   ' appts are sorted, so walk them in order
+    firstRow = r
+    curDay = -1
 
-    For d = 0 To dayCount - 1
-        dayDate = weekStart + d
-
-        cnt = 0
-        For i = 1 To n
-            If Int(appts(i)(F_KEY)) = CDbl(dayDate) Then cnt = cnt + 1
-        Next i
-
-        ' Day band
-        ws.Cells(r, 1).Value = UCase$(Format$(dayDate, "dddd")) & "   " & Format$(dayDate, "mmm d") & _
-                               "   (" & cnt & IIf(cnt = 1, " appointment)", " appointments)")
-        With ws.Range(ws.Cells(r, 1), ws.Cells(r, NCOLS))
-            .Interior.Color = band
-            .Font.Bold = True
-            .Font.Color = navy
-            .RowHeight = 20
-            .VerticalAlignment = xlCenter
-        End With
+    If n = 0 Then
+        ws.Cells(r, 1).Value = "No appointments this week"
+        ws.Cells(r, 1).Font.Italic = True
+        ws.Cells(r, 1).Font.Color = muted
         r = r + 1
+    End If
 
-        If cnt = 0 Then
-            ws.Cells(r, 1).Value = "No appointments"
-            ws.Cells(r, 1).Font.Italic = True
-            ws.Cells(r, 1).Font.Color = muted
-            r = r + 1
-        Else
-            zebra = False
-            For i = 1 To n
-                a = appts(i)
-                If Int(a(F_KEY)) = CDbl(dayDate) Then
-                    ws.Cells(r, 1).Value = a(F_TIME)
-                    ws.Cells(r, 2).Value = a(F_CUST)
-                    ws.Cells(r, 3).Value = a(F_SVC)
-                    ws.Cells(r, 4).Value = a(F_STAFF)
-                    ws.Cells(r, 5).Value = IIf(Len(a(F_TKT)) > 0, a(F_TKT), "-")
-                    ws.Cells(r, 6).Value = a(F_STATE)
-                    ws.Cells(r, 7).Value = a(F_PRI)
-                    ws.Cells(r, 8).Value = a(F_DESC)
-                    ws.Cells(r, 9).Value = a(F_ASSIGN)
-                    ws.Cells(r, 10).Value = a(F_NOTES)
+    For i = 1 To n
+        a = appts(i)
 
-                    If zebra Then ws.Range(ws.Cells(r, 1), ws.Cells(r, NCOLS)).Interior.Color = stripe
-                    zebra = Not zebra
-
-                    ' Highlights
-                    If Left$(Trim$(a(F_PRI)), 1) = "1" Or Left$(Trim$(a(F_PRI)), 1) = "2" Then
-                        ws.Cells(r, 7).Font.Bold = True
-                        ws.Cells(r, 7).Font.Color = RGB(192, 0, 0)
-                    End If
-                    If IsClosed(a(F_STATE)) Or a(F_STATE) = "Not in SNOW export" Then
-                        ws.Cells(r, 6).Font.Color = muted
-                    End If
-                    If Len(a(F_TKT)) = 0 Then ws.Cells(r, 5).Font.Color = muted
-                    ws.Cells(r, 5).Font.Bold = (Len(a(F_TKT)) > 0)
-
-                    With ws.Range(ws.Cells(r, 1), ws.Cells(r, NCOLS)).Borders(xlEdgeBottom)
-                        .LineStyle = xlContinuous
-                        .Color = rule
-                        .Weight = xlThin
-                    End With
-                    r = r + 1
-                End If
-            Next i
+        ' New day: flip shading and draw a divider
+        If Int(a(F_KEY)) <> curDay Then
+            If curDay <> -1 Then
+                With ws.Range(ws.Cells(r, 1), ws.Cells(r, NCOLS)).Borders(xlEdgeTop)
+                    .LineStyle = xlContinuous
+                    .Color = navy
+                    .Weight = xlMedium
+                End With
+            End If
+            curDay = Int(a(F_KEY))
+            shade = Not shade
         End If
 
-        ws.Rows(r).RowHeight = 8   ' spacer between days
+        If a(F_HASTIME) Then
+            ws.Cells(r, 1).Value = Format$(a(F_KEY), "ddd m/d  h:mm AM/PM")
+        Else
+            ws.Cells(r, 1).Value = Format$(a(F_KEY), "ddd m/d")
+        End If
+        ws.Cells(r, 2).Value = IIf(Len(a(F_TKT)) > 0, a(F_TKT), "-")
+        ws.Cells(r, 4).Value = a(F_SERIAL)
+        ws.Cells(r, 5).Value = a(F_NAME)
+        ws.Cells(r, 6).Value = a(F_MODEL)
+
+        If shade Then ws.Range(ws.Cells(r, 1), ws.Cells(r, NCOLS)).Interior.Color = dayFill
+        ws.Cells(r, 3).Interior.Color = fillIn       ' Old        - fill in by hand
+        ws.Cells(r, 7).Interior.Color = fillIn       ' Device Old - fill in by hand
+
+        If Len(a(F_TKT)) = 0 Then
+            ws.Cells(r, 2).Font.Color = muted
+        Else
+            ws.Cells(r, 2).Font.Bold = True
+        End If
+        If Len(a(F_SERIAL)) = 0 And Len(a(F_MODEL)) = 0 Then
+            ws.Cells(r, 6).Value = "No reservation found"
+            ws.Cells(r, 6).Font.Italic = True
+            ws.Cells(r, 6).Font.Color = muted
+        End If
+        ws.Cells(r, 1).Font.Bold = True
+
+        With ws.Range(ws.Cells(r, 1), ws.Cells(r, NCOLS)).Borders(xlEdgeBottom)
+            .LineStyle = xlContinuous
+            .Color = rule
+            .Weight = xlThin
+        End With
         r = r + 1
-    Next d
+    Next i
 
-    ' Wrap long text columns
-    ws.Range(ws.Cells(HDR_ROW + 1, 8), ws.Cells(r, 8)).WrapText = True
-    ws.Range(ws.Cells(HDR_ROW + 1, 10), ws.Cells(r, 10)).WrapText = True
-    ws.Range(ws.Cells(HDR_ROW + 1, 1), ws.Cells(r, 1)).HorizontalAlignment = xlLeft
+    With ws.Range(ws.Cells(firstRow, 1), ws.Cells(r, NCOLS))
+        .WrapText = True
+        .HorizontalAlignment = xlLeft
+    End With
 
-    ' View: no gridlines, freeze header
+    ' View
     ws.Activate
     ActiveWindow.FreezePanes = False
     ws.Range("A" & HDR_ROW + 1).Select
     ActiveWindow.FreezePanes = True
     ActiveWindow.DisplayGridlines = False
 
-    ' Print: landscape, one page wide, header row on every page
+    ' Print: landscape, one page wide, header on every page
     On Error Resume Next
     Application.PrintCommunication = False
     With ws.PageSetup
@@ -475,8 +438,8 @@ Private Function CellText(data As Variant, ByVal r As Long, ByVal c As Long) As 
     CellText = Trim$(CStr(data(r, c)))
 End Function
 
-' Accepts real Excel dates/times or text like "10/7/2026 9:00 AM",
-' "Wed, Oct 7, 2026", "2026-10-07T14:00:00", "9:00 AM - 9:30 AM"
+' Accepts real Excel dates or text like "10/7/2026 9:00 AM",
+' "Wed, Oct 7, 2026", "2026-10-07T14:00:00"
 Private Function ParseDate(ByVal v As Variant, ByRef outD As Double) As Boolean
     Dim s As String, p As Long
     If IsError(v) Or IsEmpty(v) Then Exit Function
@@ -501,7 +464,7 @@ Private Function ParseDate(ByVal v As Variant, ByRef outD As Double) As Boolean
     End If
 End Function
 
-' "Smith, Jane" -> "jane smith"
+' "Smith, Jane" -> "jane smith"   (so Bookings and SNOW names line up)
 Private Function NormName(ByVal s As String) As String
     Dim p As Long
     s = LCase$(Trim$(s))
