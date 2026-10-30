@@ -6,6 +6,8 @@ Option Explicit
 '
 '  Bookings_Data  (Bookings report)  uses: Date, Customer, Custom Fields
 '  SNOW_Data      (ServiceNow export) uses: Reserved for, Serial number, Model
+'  SNOW_Old       (ServiceNow export) uses: Current device serial number,
+'                 device name, user name, and any RITM/INC number in the row
 '
 '  Weekly output columns:
 '    Date | Ticket | Old | New | Name of User | Device New | Device Old
@@ -15,11 +17,14 @@ Option Explicit
 '                   so the name is shown once)
 '    New          = SNOW Serial number
 '    Device New   = SNOW Model
-'    Old / Device Old are left blank to fill in at the appointment
+'    Old          = SNOW_Old "Current device serial number"
+'    Device Old   = SNOW_Old device name (serial stripped out)
+'                   Old match priority: ticket + name > ticket > name.
+'                   Left blank (shaded) if no match, to fill in by hand.
 '
 '  Macros:
 '    BuildWeeklySheet  - builds the Weekly tab
-'    ClearInputData    - wipes the two paste tabs for next week
+'    ClearInputData    - wipes the paste tabs for next week
 '    AddButtons        - run once to put buttons on "Start Here"
 ' ============================================================
 
@@ -27,6 +32,7 @@ Private Const SH_SETUP As String = "Start Here"
 Private Const SH_BOOK As String = "Bookings_Data"
 Private Const SH_SNOW As String = "SNOW_Data"
 Private Const SH_OUT As String = "Weekly"
+Private Const SH_OLD As String = "SNOW_Old"
 
 Private Const NCOLS As Long = 7
 Private Const HDR_ROW As Long = 5
@@ -38,6 +44,12 @@ Private Const F_TKT As Long = 2
 Private Const F_NAME As Long = 3
 Private Const F_SERIAL As Long = 4
 Private Const F_MODEL As Long = 5
+Private Const F_OLDSER As Long = 6
+Private Const F_OLDDEV As Long = 7
+
+' Old-device rows from SNOW_Old
+Private mOldCount As Long
+Private mOldTkts() As String, mOldName() As String, mOldSer() As String, mOldDev() As String
 
 ' ------------------------------------------------------------
 '  MAIN
@@ -67,6 +79,7 @@ Public Sub BuildWeeklySheet()
     models.CompareMode = vbTextCompare
 
     LoadReservations wsS, serials, models
+    LoadOldDevices
     nAppt = LoadAppointments(wsB, weekStart, dayCount, serials, models, appts)
     If nAppt > 1 Then SortAppts appts, nAppt
     RenderWeekly wsO, weekStart, dayCount, appts, nAppt
@@ -132,6 +145,7 @@ Private Function LoadAppointments(ws As Worksheet, ByVal weekStart As Date, ByVa
     Dim cDt As Long, cCust As Long, cCustom As Long
     Dim dt As Double, dayOnly As Double
     Dim cust As String, k As String, ser As String, mdl As String
+    Dim tkts As String, oSer As String, oDev As String
 
     lastR = LastRow(ws)
     If lastR < 2 Then Err.Raise vbObjectError + 3, , _
@@ -161,14 +175,120 @@ Private Function LoadAppointments(ws As Worksheet, ByVal weekStart As Date, ByVa
                         mdl = models(k)
                     End If
                 End If
+                tkts = ExtractTickets(CellText(data, r, cCustom))
+                MatchOld tkts, k, oSer, oDev
                 n = n + 1
-                appts(n) = Array(dt, (dt - dayOnly) > 0.0001, _
-                                 ExtractTickets(CellText(data, r, cCustom)), cust, ser, mdl)
+                appts(n) = Array(dt, (dt - dayOnly) > 0.0001, tkts, cust, ser, mdl, oSer, oDev)
             End If
         End If
     Next r
 
     LoadAppointments = n
+End Function
+
+' ------------------------------------------------------------
+'  SNOW_Old: current (old) device serial + device name
+' ------------------------------------------------------------
+Private Sub LoadOldDevices()
+    Dim ws As Worksheet, lastR As Long, lastC As Long, r As Long, c As Long, data As Variant
+    Dim cName As Long, cSer As Long, cDev As Long, rowText As String, ser As String
+
+    mOldCount = 0
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(SH_OLD)
+    On Error GoTo 0
+    If ws Is Nothing Then
+        ' First run after the update: create the paste tab so it's there next week
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(SH_SNOW))
+        ws.Name = SH_OLD
+        Exit Sub
+    End If
+
+    lastR = LastRow(ws)
+    If lastR < 2 Then Exit Sub          ' nothing pasted - Old columns stay blank
+
+    cSer = FindCol(ws, "Current device serial number", "Current serial number", _
+                   "Old serial number", "Serial number", "Serial")
+    If cSer = 0 Then Err.Raise vbObjectError + 6, , _
+        SH_OLD & ": no 'Current device serial number' column found in row 1."
+    cName = FindCol(ws, "Name of user", "Requested for", "Reserved for", "User", _
+                    "Assigned to", "Caller", "Customer", "Name")
+    cDev = FindCol(ws, "Current device", "Current device name", "Current device model", _
+                   "Device name", "Device", "Model", "Model ID")
+
+    lastC = LastCol(ws)
+    data = ws.Range(ws.Cells(1, 1), ws.Cells(lastR, lastC)).Value
+    ReDim mOldTkts(1 To lastR)
+    ReDim mOldName(1 To lastR)
+    ReDim mOldSer(1 To lastR)
+    ReDim mOldDev(1 To lastR)
+
+    For r = 2 To lastR
+        ser = CellText(data, r, cSer)
+        If Len(ser) > 0 Then
+            rowText = ""
+            For c = 1 To lastC
+                rowText = rowText & " " & CellText(data, r, c)
+            Next c
+            mOldCount = mOldCount + 1
+            mOldTkts(mOldCount) = Replace(ExtractTickets(rowText), ", ", ",")
+            mOldName(mOldCount) = NormName(CellText(data, r, cName))
+            mOldSer(mOldCount) = ser
+            mOldDev(mOldCount) = CleanDevice(CellText(data, r, cDev), ser)
+        End If
+    Next r
+End Sub
+
+' Best SNOW_Old match: ticket + name (3) > ticket only (2) > name only (1)
+Private Sub MatchOld(ByVal tkts As String, ByVal nameKey As String, _
+                     ByRef ser As String, ByRef dev As String)
+    Dim i As Long, score As Long, best As Long, t As Variant
+
+    ser = ""
+    dev = ""
+    If mOldCount = 0 Then Exit Sub
+
+    For i = 1 To mOldCount
+        score = 0
+        If Len(tkts) > 0 And Len(mOldTkts(i)) > 0 Then
+            For Each t In Split(tkts, ", ")
+                If InStr(1, "," & mOldTkts(i) & ",", "," & t & ",", vbTextCompare) > 0 Then
+                    score = 2
+                    Exit For
+                End If
+            Next t
+        End If
+        If Len(nameKey) > 0 Then
+            If mOldName(i) = nameKey Then score = score + 1
+        End If
+
+        If score > best Then
+            best = score
+            ser = mOldSer(i)
+            dev = mOldDev(i)
+        ElseIf score = best And score > 0 Then
+            ' Same quality match (e.g. two old devices on one ticket): stack them
+            If InStr(1, vbLf & ser & vbLf, vbLf & mOldSer(i) & vbLf, vbTextCompare) = 0 Then
+                ser = ser & vbLf & mOldSer(i)
+                dev = dev & vbLf & mOldDev(i)
+            End If
+        End If
+    Next i
+End Sub
+
+' Device name only: removes the serial and stray separators
+Private Function CleanDevice(ByVal dev As String, ByVal ser As String) As String
+    If Len(ser) > 0 Then dev = Replace(dev, ser, "", , , vbTextCompare)
+    dev = Trim$(dev)
+    Do While Len(dev) > 0
+        If InStr(" -|,:;()[]/", Right$(dev, 1)) = 0 Then Exit Do
+        dev = Left$(dev, Len(dev) - 1)
+    Loop
+    Do While Len(dev) > 0
+        If InStr(" -|,:;()[]/", Left$(dev, 1)) = 0 Then Exit Do
+        dev = Mid$(dev, 2)
+    Loop
+    CleanDevice = dev
 End Function
 
 ' Returns every RITM+7 digits / INC+7 digits found (exact length), comma separated
@@ -214,7 +334,7 @@ End Function
 Private Sub RenderWeekly(ws As Worksheet, ByVal weekStart As Date, ByVal dayCount As Long, _
                          appts() As Variant, ByVal n As Long)
     Dim headers As Variant, widths As Variant
-    Dim r As Long, i As Long, matched As Long, a As Variant
+    Dim r As Long, i As Long, matched As Long, oldMatched As Long, a As Variant
     Dim curDay As Double, shade As Boolean, firstRow As Long
     Dim navy As Long, dayFill As Long, rule As Long, muted As Long, fillIn As Long
 
@@ -228,7 +348,8 @@ Private Sub RenderWeekly(ws As Worksheet, ByVal weekStart As Date, ByVal dayCoun
     ws.Cells.Font.Name = "Arial"
     ws.Cells.Font.Size = 10
     ws.Cells.VerticalAlignment = xlTop
-    ws.Columns(4).NumberFormat = "@"   ' keep serial numbers as text
+    ws.Columns(3).NumberFormat = "@"   ' keep serial numbers as text
+    ws.Columns(4).NumberFormat = "@"
 
     headers = Array("Date", "Ticket", "Old", "New", "Name of User", "Device New", "Device Old")
     widths = Array(20, 16, 18, 20, 26, 30, 26)
@@ -238,6 +359,7 @@ Private Sub RenderWeekly(ws As Worksheet, ByVal weekStart As Date, ByVal dayCoun
 
     For i = 1 To n
         If Len(appts(i)(F_SERIAL)) > 0 Or Len(appts(i)(F_MODEL)) > 0 Then matched = matched + 1
+        If Len(appts(i)(F_OLDSER)) > 0 Then oldMatched = oldMatched + 1
     Next i
 
     ' Title block
@@ -250,7 +372,8 @@ Private Sub RenderWeekly(ws As Worksheet, ByVal weekStart As Date, ByVal dayCoun
     ws.Range("A2").Value = "Week of " & Format$(weekStart, "dddd, mmm d") & " to " & _
                            Format$(weekStart + dayCount - 1, "dddd, mmm d, yyyy")
     ws.Range("A2").Font.Size = 11
-    ws.Range("A3").Value = n & " appointments   |   " & matched & " with a reserved device   |   built " & _
+    ws.Range("A3").Value = n & " appointments   |   " & matched & " new devices found   |   " & _
+                           oldMatched & " old devices found   |   built " & _
                            Format$(Now, "mmm d, h:mm AM/PM")
     ws.Range("A3").Font.Color = muted
 
@@ -299,13 +422,16 @@ Private Sub RenderWeekly(ws As Worksheet, ByVal weekStart As Date, ByVal dayCoun
             ws.Cells(r, 1).Value = Format$(a(F_KEY), "ddd m/d")
         End If
         ws.Cells(r, 2).Value = IIf(Len(a(F_TKT)) > 0, a(F_TKT), "-")
+        ws.Cells(r, 3).Value = a(F_OLDSER)
+        ws.Cells(r, 7).Value = a(F_OLDDEV)
         ws.Cells(r, 4).Value = a(F_SERIAL)
         ws.Cells(r, 5).Value = a(F_NAME)
         ws.Cells(r, 6).Value = a(F_MODEL)
 
         If shade Then ws.Range(ws.Cells(r, 1), ws.Cells(r, NCOLS)).Interior.Color = dayFill
-        ws.Cells(r, 3).Interior.Color = fillIn       ' Old        - fill in by hand
-        ws.Cells(r, 7).Interior.Color = fillIn       ' Device Old - fill in by hand
+        ' No old-device match: shade Old / Device Old to fill in by hand
+        If Len(a(F_OLDSER)) = 0 Then ws.Cells(r, 3).Interior.Color = fillIn
+        If Len(a(F_OLDDEV)) = 0 Then ws.Cells(r, 7).Interior.Color = fillIn
 
         If Len(a(F_TKT)) = 0 Then
             ws.Cells(r, 2).Font.Color = muted
@@ -377,10 +503,13 @@ End Sub
 '  UTILITIES
 ' ------------------------------------------------------------
 Public Sub ClearInputData()
-    If MsgBox("Clear everything pasted on Bookings_Data and SNOW_Data?", _
+    If MsgBox("Clear everything pasted on Bookings_Data, SNOW_Data and SNOW_Old?", _
               vbYesNo + vbQuestion, "Weekly Schedule Builder") = vbNo Then Exit Sub
     ThisWorkbook.Worksheets(SH_BOOK).Cells.Clear
     ThisWorkbook.Worksheets(SH_SNOW).Cells.Clear
+    On Error Resume Next
+    ThisWorkbook.Worksheets(SH_OLD).Cells.Clear
+    On Error GoTo 0
 End Sub
 
 Public Sub AddButtons()
